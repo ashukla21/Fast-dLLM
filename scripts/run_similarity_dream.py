@@ -91,6 +91,7 @@ def main(args):
 
     # Find layers and attach taps
     layers = get_decoder_layers_dream(model)
+    print(f"[Dream] tapped {len(layers)} layers")
     tap = LayerTap(layers, pool="last")
 
     prev = None
@@ -102,12 +103,40 @@ def main(args):
 
         def on_step(step: int):
             nonlocal prev
-            A = tap.stacked()  # [L, H] pooled activations per layer
-            torch.save(cosine_matrix(A), os.path.join(args.out_dir, f"within_step_cosine_step{step}.pt"))
-            if prev is not None:
-                w.writerow([step] + cosine_diag(prev, A).tolist())
-            prev = A
-            tap.clear()
+            try:
+                A = tap.stacked()  # [L, H] pooled activations per layer
+                cos = cosine_matrix(A)
+                # ensure CPU tensor for saving (Drive can be picky with device tensors)
+                if isinstance(cos, torch.Tensor):
+                    cos_cpu = cos.detach().cpu()
+                else:
+                    cos_cpu = torch.as_tensor(cos)
+
+                pt_path = os.path.join(args.out_dir, f"within_step_cosine_step{step}.pt")
+                torch.save(cos_cpu, pt_path)
+
+                # across-steps diagonal
+                if prev is not None:
+                    row = [step] + cosine_diag(prev, A).tolist()
+                    w.writerow(row)
+                    # force CSV to hit disk each step
+                    f.flush()
+                    os.fsync(f.fileno())
+
+                prev = A
+                tap.clear()
+
+                # quick heartbeat so you see it’s working
+                print(f"[Dream] step {step:02d}: saved {os.path.basename(pt_path)} (shape={tuple(cos_cpu.shape)})")
+
+            except Exception as e:
+                print(f"[Dream] on_step error at step {step}: {e}")
+                # still try to advance state so subsequent steps keep going
+                try:
+                    prev = A
+                    tap.clear()
+                except Exception:
+                    pass
 
         inputs = tok(args.prompt, return_tensors="pt").to(device)
         with torch.no_grad():
