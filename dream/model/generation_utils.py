@@ -357,24 +357,26 @@ class DreamGenerationMixin:
         threshold = kwargs.get("threshold", 0.9)
 
         result = self._sample(
-            input_ids,
-            attention_mask=attention_mask,
-            generation_config=generation_config,
-            generation_tokens_hook_func=generation_tokens_hook_func,
-            generation_logits_hook_func=generation_logits_hook_func,
-            threshold=threshold
+        input_ids,
+        attention_mask=attention_mask,
+        generation_config=generation_config,
+        generation_tokens_hook_func=generation_tokens_hook_func,
+        generation_logits_hook_func=generation_logits_hook_func,
+        threshold=threshold,
+        step_callback=kwargs.get("step_callback"),  # 👈 add this
         )
         return result
 
     def _sample(
-        self,
-        input_ids: torch.LongTensor,
-        attention_mask: Optional[torch.LongTensor],
-        generation_config: DreamGenerationConfig,
-        generation_tokens_hook_func,
-        generation_logits_hook_func,
-        threshold: Optional[float] = 0.9
-    ) -> Union[DreamModelOutput, torch.LongTensor]:
+    self,
+    input_ids: torch.LongTensor,
+    attention_mask: Optional[torch.LongTensor],
+    generation_config: DreamGenerationConfig,
+    generation_tokens_hook_func,
+    generation_logits_hook_func,
+    threshold: Optional[float] = 0.9,
+    step_callback: Optional[callable] = None,  # 👈 add this
+) -> Union[DreamModelOutput, torch.LongTensor]:
         # init values
         output_history = generation_config.output_history
         return_dict_in_generate = generation_config.return_dict_in_generate
@@ -491,6 +493,9 @@ class DreamGenerationMixin:
 
             # this allows user-defined token control of the intermediate steps
             x = generation_tokens_hook_func(i, x, logits)
+            # Call user-defined callback for this diffusion step
+            if callable(step_callback):
+                step_callback(i)
 
             if histories is not None:
                 histories.append(x.clone())
