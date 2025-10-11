@@ -26,7 +26,7 @@ def main(args):
     dtype = torch.bfloat16 if device == "cuda" else torch.float16
 
     # Replace with the correct Dream checkpoint id / loader in this repo
-    model_id = "HKUNLP/Dream-<ID>"   # <-- if the repo loads locally, adapt accordingly
+    model_id = "HKUNLP/Dream-1.7B"
     tok = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
     model = DreamModel.from_pretrained(model_id, trust_remote_code=True, torch_dtype=dtype).to(device)
     model.eval()
@@ -52,16 +52,15 @@ def main(args):
 
         inputs = tok(args.prompt, return_tensors="pt").to(device)
         with torch.no_grad():
-            # Whatever Dream's generation entrypoint is that accepts num_diffusion_steps
-            _ = model.generate(
+            _ = model.diffusion_generate(
                 inputs["input_ids"],
-                max_new_tokens=1,
+                step_callback=on_step,         # our hook
+                steps=args.steps,              # num diffusion steps
+                block_length=args.block_size,  # block size we log against
+                temperature=0.0,               # deterministic
+                max_new_tokens=1,              # same as before
                 use_cache=True,
-                num_diffusion_steps=args.steps,
-                block_size=args.block_size,
-                temperature=0.0,
-                step_callback=on_step,      # ✦ from Step 2A in Dream generation
-            )
+                )
 
     tap.remove()
     print(f"[Dream] wrote similarity logs in {args.out_dir}")
@@ -72,5 +71,6 @@ if __name__ == "__main__":
     ap.add_argument("--steps", type=int, default=8)
     ap.add_argument("--block-size", type=int, default=4)
     ap.add_argument("--prompt", type=str, default="Explain diffusion decoding briefly.")
+    ap.add_argument("--gen-length", type=int, default=64)
     args = ap.parse_args()
     main(args)
