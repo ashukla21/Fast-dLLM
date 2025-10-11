@@ -585,55 +585,22 @@ class DreamPreTrainedModel(PreTrainedModel):
     @classmethod
     def from_pretrained(
         cls,
-        pretrained_model_name_or_path: Optional[Union[str, os.PathLike]],
+        pretrained_model_name_or_path,
         *model_args,
-        config: Optional[Union[PretrainedConfig, str, os.PathLike]] = None,
-        cache_dir: Optional[Union[str, os.PathLike]] = None,
-        ignore_mismatched_sizes: bool = False,
-        force_download: bool = False,
-        local_files_only: bool = False,
-        token: Optional[Union[str, bool]] = None,
-        revision: str = "main",
-        use_safetensors: Optional[bool] = None,
-        weights_only: bool = True,
         **kwargs,
     ):
-        _model = super().from_pretrained(
+        # HF 4.47+ sometimes forwards loader-only kwargs into the model ctor.
+        # Our __init__ doesn't accept them, so remove them here.
+        kwargs.pop("weights_only", None)         # new in newer HF loaders
+        kwargs.pop("ignore_mismatched_sizes", None)  # sometimes appears
+        kwargs.pop("use_safetensors", None)      # loader flag, not an __init__ arg
+
+        # (keep torch_dtype, device_map, etc. — HF consumes those)
+        return super().from_pretrained(
             pretrained_model_name_or_path,
             *model_args,
-            config=config,
-            cache_dir=cache_dir,
-            ignore_mismatched_sizes=ignore_mismatched_sizes,
-            force_download=force_download,
-            local_files_only=local_files_only,
-            token=token,
-            revision=revision,
-            use_safetensors=use_safetensors,
-            weights_only=weights_only,
             **kwargs,
         )
-        # NOTE(Lin): we need to override the generation config
-        # because the generation config loaded in `from_pretrained` 
-        # does not include all the attributes of DreamGenerationConfig
-        resume_download = kwargs.get("resume_download", None)
-        proxies = kwargs.get("proxies", None)
-        subfolder = kwargs.get("subfolder", "")
-        from_auto_class = kwargs.get("_from_auto", False)
-        from_pipeline = kwargs.get("_from_pipeline", None)
-        _model.generation_config = DreamGenerationConfig.from_pretrained(
-            pretrained_model_name_or_path,
-            cache_dir=cache_dir,
-            force_download=force_download,
-            resume_download=resume_download,
-            proxies=proxies,
-            local_files_only=local_files_only,
-            token=token,
-            revision=revision,
-            subfolder=subfolder,
-            _from_auto=from_auto_class,
-            _from_pipeline=from_pipeline,
-        )
-        return _model
 
 class DreamBaseModel(DreamPreTrainedModel):
     """
