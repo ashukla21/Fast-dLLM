@@ -18,7 +18,7 @@
 import warnings
 import copy
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict, Optional, Tuple, Union, Callable
 
 import torch
 import torch.distributions as dists
@@ -71,7 +71,6 @@ def top_p_logits(logits, top_p=None):
 
 def top_k_logits(logits, top_k=None):
     top_k = min(top_k, logits.size(-1))  # Safety check
-    # Remove all tokens with a probability less than the last token of the top-k
     indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
     logits = logits.masked_fill(indices_to_remove, torch.finfo(logits.dtype).min)
     return logits
@@ -320,10 +319,15 @@ class DreamGenerationMixin:
         self,
         inputs: Optional[torch.Tensor] = None,
         generation_config: Optional[DreamGenerationConfig] = None,
+        step_callback: Optional[Callable[[int], None]] = None,
         **kwargs,
     ) -> Union[DreamModelOutput, torch.LongTensor]:
         # 1. Handle `generation_config` and kwargs that might update it, and validate the `.generate()` call
         generation_config = self._prepare_generation_config(generation_config, **kwargs)
+
+        # allow passing step_callback via kwargs too
+        if step_callback is None:
+            step_callback = kwargs.pop("step_callback", None)
 
         # 2. Define model inputs
         assert inputs is not None
@@ -380,7 +384,8 @@ class DreamGenerationMixin:
             generation_config=generation_config,
             threshold=threshold,
             block_length=block_length,
-            dual_cache=dual_cache
+            dual_cache=dual_cache,
+            step_callback=step_callback,   # pass through
         )
         return result
 
@@ -392,6 +397,7 @@ class DreamGenerationMixin:
         threshold: Optional[float] = 0.9,
         block_length: Optional[int] = 32,
         dual_cache: bool = False,
+        step_callback: Optional[Callable[[int], None]] = None,  # <-- ADDED
     ) -> Union[DreamModelOutput, torch.LongTensor]:
         # init values
         
@@ -440,6 +446,9 @@ class DreamGenerationMixin:
 
         # Initialize cache for the prompt
         past_key_values = None
+
+        # STEP COUNTER for callbacks
+        global_step_idx = 0
 
         # Process each block
         for num_block in range(num_blocks):
@@ -522,6 +531,11 @@ class DreamGenerationMixin:
                         x[:, current_block_start:current_block_end][transfer_index] = x_[transfer_index]
                     else:
                         x[:, current_block_start:][transfer_index] = x_[transfer_index]
+
+                    # callback after a refinement iteration
+                    if callable(step_callback):
+                        step_callback(global_step_idx)
+                    global_step_idx += 1
                 else:
                     if i == steps_per_block:
                         break
@@ -557,6 +571,11 @@ class DreamGenerationMixin:
                         else:
                             x[:, current_block_start:][row_indices,transfer_index] = x_[row_indices,transfer_index]
                     i += 1
+
+                    # callback after a refinement iteration
+                    if callable(step_callback):
+                        step_callback(global_step_idx)
+                    global_step_idx += 1
 
                 if (x[:, current_block_start:current_block_end] == mask_token_id).sum() == 0:
                     break
