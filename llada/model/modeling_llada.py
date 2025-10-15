@@ -1653,3 +1653,21 @@ class LLaDAModelLM(PreTrainedModel):
 
 # Register the model so that it is available for transformer pipelines, auto-loading, etc.
 AutoModel.register(LLaDAConfig, LLaDAModelLM)
+
+# === Layer-skip pre-step builder ===
+def make_pre_step(model: LLaDAModelLM, num_layers: int):
+    """
+    Builds a callback for diffusion or layer-skip control, similar to Dream's implementation.
+    This returns a function that accepts a LayerSkipController and yields a callable
+    (pre_step_callback) used during generation.
+    """
+    def _factory(ctrl):
+        def pre_step_callback(step_idx: int, total_steps: int, **kwargs):
+            mask = ctrl.get_mask(step_idx, total_steps, num_layers)
+            if mask is not None:
+                # Save the skip mask on model so forward() sees it
+                model._current_layer_skip_mask = mask.to(next(model.parameters()).device)
+            else:
+                model._current_layer_skip_mask = None
+        return pre_step_callback
+    return _factory
