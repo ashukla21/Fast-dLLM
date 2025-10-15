@@ -1651,20 +1651,86 @@ class LLaDAModelLM(PreTrainedModel):
         if self.config.weight_tying:
             self.model.transformer.ff_out = self.model.transformer.wte
 
+    def diffusion_generate(
+        self,
+        inputs: torch.LongTensor,
+        generation_config=None,
+        pre_step_callback=None,
+        steps: int = 128,
+        max_new_tokens: int = 128,
+        temperature: float = 0.0,
+        top_p: Optional[float] = None,
+        top_k: Optional[int] = None,
+        mask_token_id: Optional[int] = None,
+        return_dict_in_generate: bool = True,
+        output_history: bool = False,
+        threshold: Optional[float] = None,
+        **kwargs,
+    ):
+        """
+        Minimal diffusion-like generation loop for LLaDA to enable layer-skipping testing.
+        Mirrors Dream's `diffusion_generate` structure.
+        """
+
+        device = next(self.parameters()).device
+        dtype = next(self.parameters()).dtype
+        input_ids = inputs.clone().to(device)
+        B, L = input_ids.shape
+        num_layers = getattr(self.model.config, "n_layers", 32)
+        total_steps = steps
+        all_logits = []
+        history = []
+
+        for step_idx in range(total_steps):
+            # Call layer-skip controller
+            if pre_step_callback is not None:
+                pre_step_callback(step_idx, total_steps)
+
+            # Grab the current skip mask from model._current_layer_skip_mask if available
+            skip_mask = getattr(self, "_current_layer_skip_mask", None)
+
+            # Forward pass
+            outputs = self.forward(
+                input_ids=input_ids,
+                output_hidden_states=False,
+                layer_skip_mask=skip_mask,
+            )
+            logits = outputs.logits[:, -1, :]  # next-token logits
+            all_logits.append(logits.detach())
+
+            if output_history:
+                history.append(skip_mask.detach().cpu() if skip_mask is not None else None)
+
+            # Greedy sampling for now (can plug in top-k/p later)
+            next_token = torch.argmax(logits, dim=-1, keepdim=True)
+            input_ids = torch.cat([input_ids, next_token], dim=-1)
+            if input_ids.shape[-1] >= L + max_new_tokens:
+                break
+
+        class SimpleOut:
+            def __init__(self, seqs, hist):
+                self.sequences = seqs
+                self.history = hist
+
+        return SimpleOut(input_ids, history)
+
 # Register the model so that it is available for transformer pipelines, auto-loading, etc.
 AutoModel.register(LLaDAConfig, LLaDAModelLM)
 
 # === Layer-skip pre-step builder ===
-def make_pre_step(model, num_layers):
-    # capture mutable mask on the model instance
-    model._layer_skip_mask = None
+def make_pre_step(model: LLaDAModelLM, num_layers: int):
+    """
+    Builds a callback for diffusion or layer-skip control, similar to Dream's implementation.
+    This returns a function that accepts a LayerSkipController and yields a callable
+    (pre_step_callback) used during generation.
+    """
     def _factory(ctrl):
-        def _cb(step_idx: int):
-            to_skip = ctrl.layers_for_step(step_idx, num_layers=num_layers)
-            mask = torch.zeros(num_layers, dtype=torch.bool, device=model.device)
-            if to_skip:
-                mask[to_skip] = True
-            model._layer_skip_mask = mask
-        return _cb
+        def pre_step_callback(step_idx: int, total_steps: int, **kwargs):
+            mask = ctrl.get_mask(step_idx, total_steps, num_layers)
+            if mask is not None:
+                # Save the skip mask on model so forward() sees it
+                model._current_layer_skip_mask = mask.to(next(model.parameters()).device)
+            else:
+                model._current_layer_skip_mask = None
+        return pre_step_callback
     return _factory
-
