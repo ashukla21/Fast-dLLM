@@ -8,12 +8,12 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-# project imports (all local to your repo)
+# project imports (all local)
 from scheduling.layer_skip_controller import LayerSkipController
 from llada.model.modeling_llada import LLaDAModelLM, make_pre_step
 from llada.model.configuration_llada import LLaDAConfig
 
-# Optional: if your LLaDA sampler reuses Dream's generation config
+# Optional: if LLaDA sampler reuses Dream's generation config
 try:
     from dream.model.generation_utils import DreamGenerationConfig as GenCfg
 except Exception:
@@ -36,9 +36,9 @@ def main():
     # prompt + schedule
     p.add_argument("--prompt", type=str, default="Explain attention in one paragraph.")
     p.add_argument("--schedule-path", type=str, required=True)
-    # tokenizer source (HF id or local folder you already have; e.g. reuse Dream tokenizer path)
+    # tokenizer source (HF id or local folder you already have; reuse Dream tokenizer path)
     p.add_argument("--tokenizer-id", type=str, required=True,
-                   help="HF repo id or local folder for tokenizer (can reuse your Dream checkpoint folder)")
+                   help="HF repo id or local folder for tokenizer (e.g., your Dream checkpoint folder)")
     args = p.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -48,12 +48,32 @@ def main():
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(args.tokenizer_id, trust_remote_code=True)
 
-    # 2) Build model from local code (no from_pretrained)
-    #    If your config needs non-default values, set them here.
+    # 2) Build LLaDA config locally (no checkpoint). Ensure RoPE is enabled.
     cfg = LLaDAConfig()
+    # Required bits
+    cfg.rope = True
+    try:
+        cfg.vocab_size = len(tok)
+    except Exception:
+        pass
+    # If your repo expects these shapes, set them explicitly
+    # (matches the shapes seen in logs: d_model=4096, n_heads=32, ~32 layers)
+    for k, v in {
+        "d_model": 4096,
+        "n_heads": 32,
+        "effective_n_kv_heads": 32,
+        "n_layers": 32,
+        "block_type": "llama",
+        "use_cache": False,
+        "max_sequence_length": getattr(tok, "model_max_length", 4096) or 4096,
+    }.items():
+        if hasattr(cfg, k):
+            setattr(cfg, k, v)
+
+    # 3) Instantiate model from config (no from_pretrained)
     model = LLaDAModelLM(cfg).to(device).eval()
 
-    # 3) Inputs
+    # 4) Inputs
     if hasattr(tok, "apply_chat_template"):
         messages = [{"role": "user", "content": args.prompt}]
         prompt_txt = tok.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
@@ -61,7 +81,7 @@ def main():
     else:
         input_ids = tok(args.prompt, return_tensors="pt").input_ids.to(device)
 
-    # 4) Gen config/kwargs (use Dream GenCfg if available, otherwise kwargs)
+    # 5) Gen config/kwargs (use Dream GenCfg if available, else kwargs)
     gen_kwargs = dict(
         max_new_tokens=args.max_new_tokens,
         steps=args.steps,
@@ -76,41 +96,41 @@ def main():
     )
     gen_cfg = GenCfg(**gen_kwargs) if GenCfg is not None else None
 
-    # 5) Layer-skip controller + pre-step callback
+    # 6) Layer-skip controller + pre-step callback
     schedule_path = Path(args.schedule_path).expanduser().resolve()
     ctrl = LayerSkipController(str(schedule_path))
 
-    # infer number of layers (LLaDAConfig uses n_layers)
+    # infer number of layers for the skip mask
     try:
         num_layers = model.model.config.n_layers
     except Exception:
         num_layers = getattr(model.config, "n_layers",
-                      getattr(model.config, "num_hidden_layers", None))
+                             getattr(model.config, "num_hidden_layers", None))
         if num_layers is None:
             raise RuntimeError("Cannot infer number of layers for LLaDA.")
-    llada_pre_step = make_pre_step(model, num_layers)(ctrl)
+    pre_step = make_pre_step(model, num_layers)(ctrl)
 
-    # 6) Run diffusion-style generation
+    # 7) Run diffusion-style generation
     if hasattr(model, "diffusion_generate"):
         out = model.diffusion_generate(
             inputs=input_ids,
             generation_config=gen_cfg,
-            pre_step_callback=llada_pre_step,
+            pre_step_callback=pre_step,
             **({} if gen_cfg is not None else gen_kwargs),
         )
         sequences = out.sequences if hasattr(out, "sequences") else out
     else:
         raise AttributeError(
             "LLaDAModelLM has no `diffusion_generate`. "
-            "Expose a sampler entrypoint (e.g., `diffusion_generate`) that accepts `pre_step_callback`, "
-            "or import the correct generation function here."
+            "Add it in modeling_llada.py and have it accept `pre_step_callback`, "
+            "then call self.forward(..., layer_skip_mask=self._current_layer_skip_mask)."
         )
 
-    # 7) Decode + print
+    # 8) Decode + print
     text = tok.decode(sequences[0], skip_special_tokens=True)
     print(text)
 
-    # 8) Optional save
+    # 9) Optional save
     if args.output_dir:
         outdir = Path(args.output_dir).expanduser()
         outdir.mkdir(parents=True, exist_ok=True)

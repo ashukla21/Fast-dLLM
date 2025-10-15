@@ -1693,7 +1693,7 @@ class LLaDAModelLM(PreTrainedModel):
             outputs = self.forward(
                 input_ids=input_ids,
                 output_hidden_states=False,
-                layer_skip_mask=skip_mask,
+                layer_skip_mask=getattr(self, "_current_layer_skip_mask", None),
             )
             logits = outputs.logits[:, -1, :]  # next-token logits
             all_logits.append(logits.detach())
