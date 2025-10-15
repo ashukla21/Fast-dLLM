@@ -777,15 +777,30 @@ class DreamBaseModel(DreamPreTrainedModel):
         )
 
 def make_pre_step(model, num_layers):
-    # capture mutable mask on the model instance
+    """
+    Returns a factory that, when called with a LayerSkipController, produces the
+    pre_step_callback(step_idx) used by diffusion_generate.
+    """
+    # store mask on the model; runners will set it each step
     model._layer_skip_mask = None
-    def _cb(step_idx: int):
-        to_skip = ctrl.layers_for_step(step_idx, num_layers=num_layers)
-        mask = torch.zeros(num_layers, dtype=torch.bool, device=model.device)
-        if to_skip:
-            mask[to_skip] = True
-        model._layer_skip_mask = mask
-    return _cb
+
+    def bind(ctrl):
+        # resolve device robustly (works even if model.device attr doesn't exist)
+        try:
+            dev = model.device
+        except AttributeError:
+            dev = next(model.parameters()).device
+
+        def _cb(step_idx: int):
+            to_skip = ctrl.layers_for_step(step_idx, num_layers=num_layers)
+            mask = torch.zeros(num_layers, dtype=torch.bool, device=dev)
+            if to_skip:
+                mask[to_skip] = True
+            model._layer_skip_mask = mask
+
+        return _cb
+
+    return bind
 
 class DreamModel(DreamGenerationMixin, DreamPreTrainedModel):
     _tied_weights_keys = ["lm_head.weight"]

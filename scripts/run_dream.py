@@ -95,16 +95,15 @@ def main():
 
     # 4) Layer-skip controller + callback
     schedule_path = Path(args.schedule_path).expanduser().resolve()
-    ctrl = LayerSkipController(str(schedule_path))
-    # NOTE: make_pre_step(model, num_layers) returns a factory; call with ctrl to get the callback
+    ctrl = LayerSkipController(schedule_path)
     dream_pre_step = make_pre_step(model, model.config.num_hidden_layers)(ctrl)
-
-    # 5) Run diffusion
+    
     out = model.diffusion_generate(
         inputs=input_ids,
         generation_config=gen_cfg,
         pre_step_callback=dream_pre_step,
     )
+
     sequences = out.sequences if hasattr(out, "sequences") else out
     text = tok.decode(sequences[0], skip_special_tokens=True)
     print(text)
