@@ -19,6 +19,7 @@ try:
 except Exception:
     GenCfg = None  # fall back to kwargs
 
+
 def main():
     p = argparse.ArgumentParser("LLaDA diffusion runner with layer skipping (local repo model)")
     # IO / logging
@@ -50,25 +51,16 @@ def main():
 
     # 2) Build LLaDA config locally (no checkpoint). Ensure RoPE is enabled.
     cfg = LLaDAConfig()
-    # Required bits
     cfg.rope = True
-    try:
-        cfg.vocab_size = len(tok)
-    except Exception:
-        pass
-    # If your repo expects these shapes, set them explicitly
-    # (matches the shapes seen in logs: d_model=4096, n_heads=32, ~32 layers)
-    for k, v in {
-        "d_model": 4096,
-        "n_heads": 32,
-        "effective_n_kv_heads": 32,
-        "n_layers": 32,
-        "block_type": "llama",
-        "use_cache": False,
-        "max_sequence_length": getattr(tok, "model_max_length", 4096) or 4096,
-    }.items():
-        if hasattr(cfg, k):
-            setattr(cfg, k, v)
+    cfg.vocab_size = len(tok)
+    cfg.embedding_size = max(cfg.vocab_size, 4096)  # prevent vocab>embed crash
+    cfg.d_model = 4096
+    cfg.n_heads = 32
+    cfg.effective_n_kv_heads = 32
+    cfg.n_layers = 32
+    cfg.block_type = "llama"
+    cfg.use_cache = False
+    cfg.max_sequence_length = getattr(tok, "model_max_length", 4096) or 4096
 
     # 3) Instantiate model from config (no from_pretrained)
     model = LLaDAModelLM(cfg).to(device).eval()
@@ -91,7 +83,7 @@ def main():
         mask_token_id=args.mask_token_id,
         return_dict_in_generate=True,
         output_history=args.save_history,
-        threshold=args.threshold,  # only used if your sampler supports it
+        threshold=args.threshold,
         torch_dtype=dtype,
     )
     gen_cfg = GenCfg(**gen_kwargs) if GenCfg is not None else None
@@ -100,7 +92,6 @@ def main():
     schedule_path = Path(args.schedule_path).expanduser().resolve()
     ctrl = LayerSkipController(str(schedule_path))
 
-    # infer number of layers for the skip mask
     try:
         num_layers = model.model.config.n_layers
     except Exception:
@@ -154,6 +145,7 @@ def main():
             "tokenizer_id": args.tokenizer_id,
         }
         (outdir / f"meta_{stamp}.json").write_text(json.dumps(meta, indent=2))
+
 
 if __name__ == "__main__":
     main()
