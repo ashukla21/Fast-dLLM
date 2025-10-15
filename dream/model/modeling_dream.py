@@ -408,6 +408,7 @@ class DreamSdpaAttention(DreamAttention):
                 past_value[:, replace_indices] = value_states
                 value_states = past_value
             else:
+                replace_indices = None
                 past_key, past_value = past_key_value
                 key_states = torch.cat([past_key, key_states], dim=-2)
                 value_states = torch.cat([past_value, value_states], dim=-2)
@@ -431,6 +432,11 @@ class DreamSdpaAttention(DreamAttention):
         
         if dual_cache:
             query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, block_end_index=replace_indices.max()+1)
+        else:
+            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        
+        if dual_cache and replace_indices is not None:
+            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, block_end_index=replace_indices.max() + 1)
         else:
             query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
@@ -523,6 +529,15 @@ class DreamDecoderLayer(nn.Module):
                 Arbitrary kwargs to be ignored, used for FSDP and other methods that injects code
                 into the model
         """
+        skip_layer: bool = kwargs.pop("skip_layer", False)
+        if skip_layer:
+            outputs = (hidden_states,)
+            if output_attentions:
+                outputs += (None,)
+            if use_cache:
+                # pass through the incoming cache so shapes stay consistent
+                outputs += (past_key_value,)
+            return outputs
 
         residual = hidden_states
 
@@ -647,6 +662,7 @@ class DreamBaseModel(DreamPreTrainedModel):
         cache_position: Optional[torch.LongTensor] = None,
         dual_cache: Optional[bool] = False,
         replace_position: Optional[torch.Tensor] = None,
+        layer_skip_mask: Optional[torch.Tensor] = None,
     ) -> Union[Tuple, BaseModelOutput]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -699,24 +715,28 @@ class DreamBaseModel(DreamPreTrainedModel):
         all_self_attns = () if output_attentions else None
 
         for layer_idx, decoder_layer in enumerate(self.layers):
+            skip_this = False
+            if layer_skip_mask is not None:
+                # layer_skip_mask is 1/True for skip, 0/False for keep
+                skip_this = bool(layer_skip_mask[layer_idx].item() if torch.is_tensor(layer_skip_mask) else layer_skip_mask[layer_idx])
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
             layer_past_key_value = past_key_values[layer_idx] if past_key_values is not None else None
 
             if self.gradient_checkpointing and self.training:
-                layer_outputs = self._gradient_checkpointing_func(
-                    decoder_layer.__call__,
+                layer_outputs = decoder_layer(
                     hidden_states,
-                    attention_mask,
-                    position_ids,
-                    layer_past_key_value,
-                    output_attentions,
-                    use_cache,
-                    cache_position,
-                    position_embeddings,
-                    dual_cache,
-                    replace_position,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_value=layer_past_key_value,
+                    output_attentions=output_attentions,
+                    use_cache=use_cache,
+                    cache_position=cache_position,
+                    position_embeddings=position_embeddings,
+                    dual_cache=dual_cache,
+                    replace_position=replace_position,
+                    skip_layer=skip_this,
                 )
             else:
                 layer_outputs = decoder_layer(
@@ -730,6 +750,7 @@ class DreamBaseModel(DreamPreTrainedModel):
                     position_embeddings=position_embeddings,
                     dual_cache=dual_cache,
                     replace_position=replace_position,
+                    skip_layer=skip_this,
                 )
 
             hidden_states = layer_outputs[0]
@@ -737,7 +758,8 @@ class DreamBaseModel(DreamPreTrainedModel):
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
             if use_cache:
-                attn_key_values.append(layer_outputs[1])
+                present = layer_outputs[2] if output_attentions else layer_outputs[1]
+                attn_key_values.append(present)
 
         hidden_states = self.norm(hidden_states)
 
@@ -754,6 +776,16 @@ class DreamBaseModel(DreamPreTrainedModel):
             past_key_values=attn_key_values,
         )
 
+def make_pre_step(model, num_layers):
+    # capture mutable mask on the model instance
+    model._layer_skip_mask = None
+    def _cb(step_idx: int):
+        to_skip = ctrl.layers_for_step(step_idx, num_layers=num_layers)
+        mask = torch.zeros(num_layers, dtype=torch.bool, device=model.device)
+        if to_skip:
+            mask[to_skip] = True
+        model._layer_skip_mask = mask
+    return _cb
 
 class DreamModel(DreamGenerationMixin, DreamPreTrainedModel):
     _tied_weights_keys = ["lm_head.weight"]
@@ -806,6 +838,7 @@ class DreamModel(DreamGenerationMixin, DreamPreTrainedModel):
         num_logits_to_keep: int = 0,
         dual_cache: Optional[bool] = False,
         replace_position: Optional[torch.Tensor] = None,
+        layer_skip_mask: Optional[torch.Tensor] = None,
         **loss_kwargs,
     ) -> Union[Tuple, MaskedLMOutput]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -828,6 +861,7 @@ class DreamModel(DreamGenerationMixin, DreamPreTrainedModel):
             cache_position=cache_position,
             dual_cache=dual_cache,
             replace_position=replace_position,
+            layer_skip_mask=layer_skip_mask,
         )
         hidden_states = outputs[0]
         # Only compute necessary logits, and do not upcast them to float if we are not computing the loss

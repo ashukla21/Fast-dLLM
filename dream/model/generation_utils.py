@@ -357,26 +357,30 @@ class DreamGenerationMixin:
         threshold = kwargs.get("threshold", 0.9)
 
         result = self._sample(
-        input_ids,
-        attention_mask=attention_mask,
-        generation_config=generation_config,
-        generation_tokens_hook_func=generation_tokens_hook_func,
-        generation_logits_hook_func=generation_logits_hook_func,
-        threshold=threshold,
-        step_callback=kwargs.get("step_callback"),  # 👈 add this
+            input_ids,
+            attention_mask=attention_mask,
+            generation_config=generation_config,
+            generation_tokens_hook_func=generation_tokens_hook_func,
+            generation_logits_hook_func=generation_logits_hook_func,
+            threshold=threshold,
+            step_callback=kwargs.get("step_callback"),
+            pre_step_callback=kwargs.get("pre_step_callback"),   # keep
+            post_step_callback=kwargs.get("post_step_callback"), # keep
         )
         return result
 
     def _sample(
-    self,
-    input_ids: torch.LongTensor,
-    attention_mask: Optional[torch.LongTensor],
-    generation_config: DreamGenerationConfig,
-    generation_tokens_hook_func,
-    generation_logits_hook_func,
-    threshold: Optional[float] = 0.9,
-    step_callback: Optional[callable] = None,  # 👈 add this
-) -> Union[DreamModelOutput, torch.LongTensor]:
+        self,
+        input_ids: torch.LongTensor,
+        attention_mask: Optional[torch.LongTensor],
+        generation_config: DreamGenerationConfig,
+        generation_tokens_hook_func,
+        generation_logits_hook_func,
+        threshold: Optional[float] = 0.9,
+        step_callback: Optional[callable] = None,
+        pre_step_callback: Optional[callable] = None,
+        post_step_callback: Optional[callable] = None,
+    ) -> Union[DreamModelOutput, torch.LongTensor]:
         # init values
         output_history = generation_config.output_history
         return_dict_in_generate = generation_config.return_dict_in_generate
@@ -423,24 +427,44 @@ class DreamGenerationMixin:
             number_transfer_tokens = mask_index.sum().item() // steps
             left_tokens_last_step = 0
         while i < steps:
-            mask_index = (x == mask_token_id)
-            logits = self(x, attention_mask, tok_idx).logits
-            logits = torch.cat([logits[:,:1], logits[:, :-1]], dim=1)
+        # ---- PRE step: allow schedule updates, monkeypatching, etc.
+            if callable(pre_step_callback):
+                try:
+                    pre_step_callback(i)  # sets model._layer_skip_mask
+                except Exception as _e:
+                    print(f"[Dream] pre_step_callback error at step {i}: {_e}")
 
-            # this allows user-defined logits control of the intermediate steps
+            mask_index = (x == mask_token_id)
+            logits = self(
+                x,
+                attention_mask,
+                tok_idx,
+                layer_skip_mask=getattr(self, "_layer_skip_mask", None),
+            ).logits
+            logits = torch.cat([logits[:, :1], logits[:, :-1]], dim=1)
+
+            # One (and only one) logits hook
             logits = generation_logits_hook_func(i, x, logits)
 
-            mask_logits = logits[mask_index]
-            if not alg == 'confidence_threshold':
+            # Compute step schedule params
+            if alg != 'confidence_threshold':
                 t = timesteps[i]
                 s = timesteps[i + 1]
-        
+
+            # Use current mask to pull the positions we will update this step
+            mask_logits = logits[mask_index]
+
+            # ------- diffusion update branches (unchanged) -------
             if alg == 'origin':
                 p_transfer = 1 - s / t if i < steps - 1 else 1
                 x0 = torch.zeros_like(x[mask_index], device=self.device, dtype=torch.long) + mask_token_id
                 transfer_index_t_s = torch.rand(*x0.shape, device=self.device) < p_transfer
-                _, x0[transfer_index_t_s]= sample_tokens(mask_logits[transfer_index_t_s], temperature=temperature, top_p=top_p, top_k=top_k)
+                _, x0[transfer_index_t_s] = sample_tokens(
+                    mask_logits[transfer_index_t_s],
+                    temperature=temperature, top_p=top_p, top_k=top_k
+                )
                 x[mask_index] = x0.clone()
+
             elif alg == 'confidence_threshold':
                 confidence, x0 = sample_tokens(mask_logits, temperature=temperature, top_p=top_p, top_k=top_k)
                 x_ = torch.zeros_like(x, device=self.device, dtype=torch.long) + mask_token_id
@@ -463,7 +487,6 @@ class DreamGenerationMixin:
                             steps += 1
                             left_tokens_last_step += 1
                             transfer_index[0, select_index[0, k]] = False
-
                 x[transfer_index] = x_[transfer_index].clone()
 
             else:
@@ -475,6 +498,7 @@ class DreamGenerationMixin:
                     confidence, x0 = sample_tokens(mask_logits, temperature, top_p=top_p, top_k=top_k, neg_entropy=True)
                 else:
                     raise RuntimeError(f"Unknown alg: {alg}")
+
                 num_mask_token = mask_index.sum() / mask_index.shape[0]
                 number_transfer_tokens = int(num_mask_token * (1 - s / t)) if i < steps - 1 else int(num_mask_token)
                 full_confidence = torch.full_like(x, -torch.inf, device=self.device, dtype=logits.dtype)
@@ -489,11 +513,20 @@ class DreamGenerationMixin:
                     x_ = torch.zeros_like(x, device=self.device, dtype=torch.long) + mask_token_id
                     x_[mask_index] = x0.clone()
                     row_indices = torch.arange(x.size(0), device=self.device).unsqueeze(1).expand_as(transfer_index)
-                    x[row_indices,transfer_index] = x_[row_indices,transfer_index]
+                    x[row_indices, transfer_index] = x_[row_indices, transfer_index]
+            # ------- end update branches -------
 
-            # this allows user-defined token control of the intermediate steps
+            # Token hook AFTER the update
             x = generation_tokens_hook_func(i, x, logits)
-            # Call user-defined callback for this diffusion step
+
+            # Post-step hook
+            if callable(post_step_callback):
+                try:
+                    post_step_callback(i, x, logits)
+                except Exception as _e:
+                    print(f"[Dream] post_step_callback error at step {i}: {_e}")
+
+            # Existing similarity logging callback
             if callable(step_callback):
                 step_callback(i)
 

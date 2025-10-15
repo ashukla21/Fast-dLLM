@@ -56,6 +56,18 @@ def get_num_transfer_tokens(mask_index: torch.Tensor, steps: int) -> torch.Tenso
         num_transfer_tokens[i, : remainder[i]] += 1
     return num_transfer_tokens
 
+from fastdllm.scheduling.layer_skip_controller import LayerSkipController
+
+def make_pre_step_llada(model, ctrl):
+    model._layer_skip_mask = None
+    num_layers = model.config.n_layers
+    def _cb(step_idx: int):
+        to_skip = ctrl.layers_for_step(step_idx, num_layers=num_layers)
+        mask = torch.zeros(num_layers, dtype=torch.bool, device=model.device)
+        if to_skip:
+            mask[to_skip] = True
+        model._layer_skip_mask = mask
+    return _cb
 
 @torch.no_grad()
 def generate(
@@ -70,6 +82,10 @@ def generate(
     threshold: Optional[float] = None,
     factor: Optional[float] = None,
     step_callback: Optional[Callable[[int], None]] = None,
+    pre_step_callback: Optional[Callable[[int], None]] = None,
+    post_step_callback: Optional[Callable[[int, torch.Tensor, torch.Tensor], None]] = None,
+    generation_logits_hook: Optional[Callable[[int, torch.Tensor, torch.Tensor], torch.Tensor]] = None,
+    generation_tokens_hook: Optional[Callable[[int, torch.Tensor, torch.Tensor], torch.Tensor]] = None,
 ):
     """
     Vanilla LLaDA diffusion decoding (no cache).
@@ -84,6 +100,10 @@ def generate(
         remasking: 'low_confidence' or 'random'.
         mask_id: Token id of [MASK] (126336 for LLaDA-8B).
     """
+    if generation_logits_hook is None:
+        generation_logits_hook = lambda i, x, logits: logits
+    if generation_tokens_hook is None:
+        generation_tokens_hook = lambda i, x, logits: x
     x = torch.full(
         (prompt.shape[0], prompt.shape[1] + gen_length),
         mask_id,
@@ -111,10 +131,23 @@ def generate(
 
         while True:
             nfe += 1
+
+            # (1) pre-step hook (e.g., apply layer-skip schedule)
+            if callable(pre_step_callback):
+                try:
+                    pre_step_callback(step_idx)
+                except Exception as _e:
+                    print(f"[LLaDA] pre_step_callback error at step {step_idx}: {_e}")
+
+            # (2) forward -> logits
             mask_index = (x == mask_id)
-            logits = model(x).logits
+            logits = model(x, layer_skip_mask=getattr(model, "_layer_skip_mask", None),).logits
+            logits = generation_logits_hook(step_idx, x, logits)
+
+            # respect block boundary
             mask_index[:, end:] = 0
 
+            # (3) update x using your existing transfer logic
             if factor is None:
                 x0, transfer_index = get_transfer_index(
                     logits,
@@ -129,9 +162,19 @@ def generate(
                 x0, transfer_index = get_transfer_index_dynamic(
                     logits, temperature, remasking, mask_index, x, None, factor
                 )
-
             x[transfer_index] = x0[transfer_index]
 
+            # (4) post-update token hook (lets you rewrite x if needed)
+            x = generation_tokens_hook(step_idx, x, logits)
+
+            # (5) post-step hook (e.g., log, collect stats)
+            if callable(post_step_callback):
+                try:
+                    post_step_callback(step_idx, x, logits)
+                except Exception as _e:
+                    print(f"[LLaDA] post_step_callback error at step {step_idx}: {_e}")
+
+            # (6) existing step callback
             if callable(step_callback):
                 step_callback(step_idx)
             step_idx += 1
@@ -156,10 +199,18 @@ def generate_with_prefix_cache(
     threshold: Optional[float] = None,
     factor: Optional[float] = None,
     step_callback: Optional[Callable[[int], None]] = None,
+    pre_step_callback: Optional[Callable[[int], None]] = None,
+    post_step_callback: Optional[Callable[[int, torch.Tensor, torch.Tensor], None]] = None,
+    generation_logits_hook: Optional[Callable[[int, torch.Tensor, torch.Tensor], torch.Tensor]] = None,
+    generation_tokens_hook: Optional[Callable[[int, torch.Tensor, torch.Tensor], torch.Tensor]] = None,
 ):
     """
     LLaDA decoding with a prefix KV-cache.
     """
+    if generation_logits_hook is None:
+        generation_logits_hook = lambda i, x, logits: logits
+    if generation_tokens_hook is None:
+        generation_tokens_hook = lambda i, x, logits: x
     x = torch.full(
         (prompt.shape[0], prompt.shape[1] + gen_length),
         mask_id,
@@ -185,13 +236,21 @@ def generate_with_prefix_cache(
         num_transfer_tokens = get_num_transfer_tokens(block_mask_index, steps_per_block)
 
         output = model(x, use_cache=True)
-        past_key_values = output.past_key_values
+        # (1) pre-step
+        if callable(pre_step_callback):
+            try:
+                pre_step_callback(step_idx)
+            except Exception as _e:
+                print(f"[LLaDA] pre_step_callback error at step {step_idx}: {_e}")
 
         mask_index = (x == mask_id)
         mask_index[:, end:] = 0
+        logits = output.logits
+        logits = generation_logits_hook(step_idx, x, logits)
+
         if factor is None:
             x0, transfer_index = get_transfer_index(
-                output.logits,
+                logits,
                 temperature,
                 remasking,
                 mask_index,
@@ -201,13 +260,22 @@ def generate_with_prefix_cache(
             )
         else:
             x0, transfer_index = get_transfer_index_dynamic(
-                output.logits, temperature, remasking, mask_index, x, None, factor
+                logits, temperature, remasking, mask_index, x, None, factor
             )
         x[transfer_index] = x0[transfer_index]
+        x = generation_tokens_hook(step_idx, x, logits)
+
+        if callable(post_step_callback):
+            try:
+                post_step_callback(step_idx, x, logits)
+            except Exception as _e:
+                print(f"[LLaDA] post_step_callback error at step {step_idx}: {_e}")
 
         if callable(step_callback):
             step_callback(step_idx)
         step_idx += 1
+
+        past_key_values = output.past_key_values
 
         # keep only prefix cache
         new_past_key_values = []
@@ -225,15 +293,23 @@ def generate_with_prefix_cache(
                 break
 
             nfe += 1
+
+            if callable(pre_step_callback):
+                try:
+                    pre_step_callback(step_idx)
+                except Exception as _e:
+                    print(f"[LLaDA] pre_step_callback error at step {step_idx}: {_e}")
+
             mask_index = (x[:, start:] == mask_id)
             mask_index[:, block_length:] = 0
 
-            logits = model(
-                x[:, start:], past_key_values=past_key_values, use_cache=True
-            ).logits
+            out = model(x[:, start:], past_key_values=past_key_values, use_cache=True)
+            logits = out.logits
+            logits = generation_logits_hook(step_idx, x[:, start:], logits)
 
-            logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
-            _ = torch.argmax(logits_with_noise, dim=-1)  # not used directly
+            # (optional) leave your gumbel line as-is if you like:
+            # logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
+            # _ = torch.argmax(logits_with_noise, dim=-1)
 
             if factor is None:
                 x0, transfer_index = get_transfer_index(
@@ -251,6 +327,13 @@ def generate_with_prefix_cache(
                 )
 
             x[:, start:][transfer_index] = x0[transfer_index]
+            x = generation_tokens_hook(step_idx, x, logits)
+
+            if callable(post_step_callback):
+                try:
+                    post_step_callback(step_idx, x, logits)
+                except Exception as _e:
+                    print(f"[LLaDA] post_step_callback error at step {step_idx}: {_e}")
 
             if callable(step_callback):
                 step_callback(step_idx)
@@ -274,10 +357,18 @@ def generate_with_dual_cache(
     threshold: Optional[float] = None,
     factor: Optional[float] = None,
     step_callback: Optional[Callable[[int], None]] = None,
+    pre_step_callback: Optional[Callable[[int], None]] = None,
+    post_step_callback: Optional[Callable[[int, torch.Tensor, torch.Tensor], None]] = None,
+    generation_logits_hook: Optional[Callable[[int, torch.Tensor, torch.Tensor], torch.Tensor]] = None,
+    generation_tokens_hook: Optional[Callable[[int, torch.Tensor, torch.Tensor], torch.Tensor]] = None,
 ):
     """
     LLaDA decoding with a dual-cache strategy (cache window for current block).
     """
+    if generation_logits_hook is None:
+        generation_logits_hook = lambda i, x, logits: logits
+    if generation_tokens_hook is None:
+        generation_tokens_hook = lambda i, x, logits: x
     x = torch.full(
         (prompt.shape[0], prompt.shape[1] + gen_length),
         mask_id,
@@ -304,13 +395,21 @@ def generate_with_dual_cache(
 
         # cache init + first update
         output = model(x, use_cache=True)
-        past_key_values = output.past_key_values
+        # (1) pre-step
+        if callable(pre_step_callback):
+            try:
+                pre_step_callback(step_idx)
+            except Exception as _e:
+                print(f"[LLaDA] pre_step_callback error at step {step_idx}: {_e}")
 
         mask_index = (x == mask_id)
         mask_index[:, end:] = 0
+        logits = output.logits
+        logits = generation_logits_hook(step_idx, x, logits)
+
         if factor is None:
             x0, transfer_index = get_transfer_index(
-                output.logits,
+                logits,
                 temperature,
                 remasking,
                 mask_index,
@@ -320,15 +419,32 @@ def generate_with_dual_cache(
             )
         else:
             x0, transfer_index = get_transfer_index_dynamic(
-                output.logits, temperature, remasking, mask_index, x, None, factor
+                logits, temperature, remasking, mask_index, x, None, factor
             )
         x[transfer_index] = x0[transfer_index]
-        nfe += 1
+        x = generation_tokens_hook(step_idx, x, logits)
+
+        if callable(post_step_callback):
+            try:
+                post_step_callback(step_idx, x, logits)
+            except Exception as _e:
+                print(f"[LLaDA] post_step_callback error at step {step_idx}: {_e}")
 
         if callable(step_callback):
             step_callback(step_idx)
         step_idx += 1
 
+        past_key_values = output.past_key_values
+
+        # keep only prefix cache
+        new_past_key_values = []
+        for i in range(len(past_key_values)):
+            new_past_key_values.append(())
+            for j in range(len(past_key_values[i])):
+                new_past_key_values[i] += (past_key_values[i][j][:, :, :start],)
+        past_key_values = new_past_key_values
+
+        nfe += 1
         i = 1
         replace_position = torch.zeros_like(x, dtype=torch.bool)
         replace_position[:, start:end] = 1
@@ -337,37 +453,59 @@ def generate_with_dual_cache(
             if (x[:, start:end] == mask_id).sum() == 0:
                 break
 
-            nfe += 1
-            mask_index = (x[:, start:end] == mask_id)
+        nfe += 1
 
-            logits = model(
-                x[:, start:end],
-                past_key_values=past_key_values,
-                use_cache=True,
-                replace_position=replace_position,
-            ).logits
+        if callable(pre_step_callback):
+            try:
+                pre_step_callback(step_idx)
+            except Exception as _e:
+                print(f"[LLaDA] pre_step_callback error at step {step_idx}: {_e}")
 
-            if factor is None:
-                x0, transfer_index = get_transfer_index(
-                    logits,
-                    temperature,
-                    remasking,
-                    mask_index,
-                    x[:, start:end],
-                    num_transfer_tokens[:, i] if threshold is None else None,
-                    threshold,
-                )
-            else:
-                x0, transfer_index = get_transfer_index_dynamic(
-                    logits, temperature, remasking, mask_index, x[:, start:end], None, factor
-                )
-            x[:, start:end][transfer_index] = x0[transfer_index]
+        # Forward only on the current block (window) with dual cache
+        out = model(
+            x[:, start:end],
+            past_key_values=past_key_values,
+            use_cache=True,
+            replace_position=replace_position,
+        )
+        logits = out.logits                              # [B, block_length, V]
+        logits = generation_logits_hook(step_idx, x[:, start:end], logits)
 
-            if callable(step_callback):
-                step_callback(step_idx)
-            step_idx += 1
+        # Window-local mask
+        mask_index = (x[:, start:end] == mask_id)        # [B, block_length]
 
-            i += 1
+        # --- Single, window-local transfer ---
+        if factor is None:
+            x0, transfer_index = get_transfer_index(
+                logits,
+                temperature,
+                remasking,
+                mask_index,
+                x[:, start:end],                         # pass window x
+                num_transfer_tokens[:, i] if threshold is None else None,
+                threshold,
+            )
+        else:
+            x0, transfer_index = get_transfer_index_dynamic(
+                logits, temperature, remasking, mask_index, x[:, start:end], None, factor
+            )
+
+        # Write back only into the window
+        x[:, start:end][transfer_index] = x0[transfer_index]
+
+        # Token-level post-edit hook (you can pass full x; logits are window-sized)
+        x = generation_tokens_hook(step_idx, x, logits)
+
+        if callable(post_step_callback):
+            try:
+                post_step_callback(step_idx, x, logits)
+            except Exception as _e:
+                print(f"[LLaDA] post_step_callback error at step {step_idx}: {_e}")
+
+        if callable(step_callback):
+            step_callback(step_idx)
+        step_idx += 1
+        i += 1
 
     return x, nfe
 
