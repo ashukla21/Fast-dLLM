@@ -22,8 +22,9 @@ class LayerSkipController:
         # clamp to valid range just in case
         return [i for i in li if 0 <= i < num_layers]
     
+
     def get_mask(self, step_idx, total_steps, num_layers):
-            """
+        """
         Return the layer skip mask for this step.
         Compatible with Dream's controller interface.
         """
