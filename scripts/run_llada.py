@@ -3,6 +3,14 @@ import argparse, os, sys, json, time
 from pathlib import Path
 import torch
 
+import torch
+torch.set_float32_matmul_precision("high")
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+torch.backends.cuda.enable_flash_sdp(False)
+torch.backends.cuda.enable_mem_efficient_sdp(True)
+torch.backends.cuda.enable_math_sdp(True)
+
 # --- make repo root importable ---
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -51,6 +59,10 @@ def main():
 
     # 2) Build LLaDA config locally (no checkpoint). Ensure RoPE is enabled.
     cfg = LLaDAConfig()
+    cfg.d_model = 2048
+    cfg.n_heads = 16
+    cfg.effective_n_kv_heads = 16
+    cfg.n_layers = 16
     cfg.rope = True
     cfg.vocab_size = len(tok)
     cfg.embedding_size = max(cfg.vocab_size, 4096)  # prevent vocab>embed crash
