@@ -21,3 +21,20 @@ class LayerSkipController:
             return li
         # clamp to valid range just in case
         return [i for i in li if 0 <= i < num_layers]
+    
+    def get_mask(self, step_idx, total_steps, num_layers):
+            """
+        Return the layer skip mask for this step.
+        Compatible with Dream's controller interface.
+        """
+        if hasattr(self, "__call__"):
+            return self(step_idx, total_steps, num_layers)
+        elif hasattr(self, "step_mask"):
+            return self.step_mask(step_idx, total_steps, num_layers)
+        elif hasattr(self, "mask_schedule"):
+            # Fallback if you have precomputed schedule
+            step_idx = min(step_idx, len(self.mask_schedule) - 1)
+            return torch.tensor(self.mask_schedule[step_idx], dtype=torch.bool)
+        else:
+            raise AttributeError("LayerSkipController has no mask computation method.")
+
