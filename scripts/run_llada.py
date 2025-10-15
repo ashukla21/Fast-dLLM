@@ -6,14 +6,14 @@ import torch
 from transformers import AutoTokenizer
 
 # LLaDA model wrapper (HF PreTrainedModel)
-from fastdllm.modeling_llada import LLaDAModelLM, make_pre_step
+from llada.model.modeling_llada import LLaDAModelLM, make_pre_step
 # Layer-skip schedule controller
-from fastdllm.scheduling.layer_skip_controller import LayerSkipController
+from scheduling.layer_skip_controller import LayerSkipController
 
 # If your LLaDA diffusion API reuses the Dream generation config/mixin, this import will work.
 # If you created a separate config for LLaDA, swap the import below accordingly.
 try:
-    from fastdllm.generation_utils import DreamGenerationConfig as _GenCfg  # shared config
+    from dream.model.generation_utils import DreamGenerationConfig as _GenCfg  # shared config
 except Exception:
     _GenCfg = None
 

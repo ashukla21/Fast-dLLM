@@ -3,8 +3,8 @@ import argparse
 from pathlib import Path
 import torch
 
-from fastdllm.scheduling.layer_skip_controller import LayerSkipController
-from fastdllm.modeling_dream import DreamModel, DreamGenerationConfig, make_pre_step
+from scheduling.layer_skip_controller import LayerSkipController
+from dream.model.modeling_dream import DreamModel, DreamGenerationConfig, make_pre_step
 # ^ adjust imports to your actual package layout
 
 def main():
