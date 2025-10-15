@@ -11,7 +11,7 @@ if str(REPO_ROOT) not in sys.path:
 
 # project imports
 from scheduling.layer_skip_controller import LayerSkipController
-from llada.modeling_llada import LLaDAModelLM, make_pre_step  # ensure make_pre_step exists in modeling_llada
+from llada.model.modeling_llada import LLaDAModelLM, make_pre_step  # ensure make_pre_step exists in modeling_llada
 
 # Reuse Dream's generation config if your LLaDA sampler expects it
 try:
