@@ -1,6 +1,9 @@
 import json
 from typing import Dict, List, Optional
 
+import torch
+
+
 class LayerSkipController:
     """
     Loads a JSON schedule like:
@@ -21,21 +24,14 @@ class LayerSkipController:
             return li
         # clamp to valid range just in case
         return [i for i in li if 0 <= i < num_layers]
-    
 
-    def get_mask(self, step_idx, total_steps, num_layers):
+    def get_mask(self, step_idx: int, total_steps: int, num_layers: int) -> torch.BoolTensor:
         """
-        Return the layer skip mask for this step.
+        Return a boolean mask of length `num_layers` where True = skip this layer.
         Compatible with Dream's controller interface.
         """
-        if hasattr(self, "__call__"):
-            return self(step_idx, total_steps, num_layers)
-        elif hasattr(self, "step_mask"):
-            return self.step_mask(step_idx, total_steps, num_layers)
-        elif hasattr(self, "mask_schedule"):
-            # Fallback if you have precomputed schedule
-            step_idx = min(step_idx, len(self.mask_schedule) - 1)
-            return torch.tensor(self.mask_schedule[step_idx], dtype=torch.bool)
-        else:
-            raise AttributeError("LayerSkipController has no mask computation method.")
-
+        to_skip = self.layers_for_step(step_idx, num_layers=num_layers)
+        mask = torch.zeros(num_layers, dtype=torch.bool)
+        if to_skip:
+            mask[to_skip] = True
+        return mask
