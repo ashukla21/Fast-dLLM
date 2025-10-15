@@ -987,7 +987,10 @@ class LLaDALlamaBlock(LLaDABlock):
             x = self._activation_checkpoint_fn(self.act, x)  # type: ignore
         else:
             x = self.act(x)
-        x = x * x_up # new add
+        if x_up.shape[-1] != x.shape[-1]:
+            # down-project x_up to match x
+            x_up = x_up[..., :x.shape[-1]]
+        x = x * x_up
         x = self.ff_out(x)
         x = self.dropout(x)
         x = og_x + x
@@ -1093,7 +1096,10 @@ class LLaDABlockDiffBlock(LLaDABlock):
             x = self._activation_checkpoint_fn(self.act, x)  # type: ignore
         else:
             x = self.act(x)
-        x = x * x_up # new add
+        if x_up.shape[-1] != x.shape[-1]:
+            # down-project x_up to match x
+            x_up = x_up[..., :x.shape[-1]]
+        x = x * x_up
         x = self.ff_out(x)
         x = self.dropout(x)
         x = og_x + x
